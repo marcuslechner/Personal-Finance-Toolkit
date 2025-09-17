@@ -10,14 +10,10 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 OUT_BASE = Path(__file__).resolve().parents[1] / "out"
 MONTH_DIR = OUT_BASE / "months"
 
-# These are the four files you mentioned. Keep/adjust as needed.
-FILES: List[str] = [
-    "report(1).csv",
-    "Summary.csv",
-    "Summary(7).csv",
-    "accountactivity(2).csv",
-]
-
+# Take ALL .csv files in data/
+def list_input_files() -> List[Path]:
+    return sorted((p for p in DATA_DIR.glob("*.csv") if p.is_file()),
+                  key=lambda p: p.name.lower())
 MONTHS = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
     "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
@@ -125,12 +121,10 @@ def parse_amex_summary_with_headers(path: Path) -> pd.DataFrame:
     df = raw.iloc[header_row + 1 :].copy()
     df.columns = header
 
-    # Ensure columns
     if "Date" not in df.columns:
         raise ValueError("Amex: 'Date' column not found after header normalization")
 
     if "Description" not in df.columns:
-        # Try exact (case-insensitive) then fallback to a likely text column
         for c in list(df.columns):
             if str(c).strip().lower() == "description":
                 df = df.rename(columns={c: "Description"})
@@ -138,14 +132,12 @@ def parse_amex_summary_with_headers(path: Path) -> pd.DataFrame:
         if "Description" not in df.columns:
             df = df.rename(columns={df.columns[2]: "Description"})
 
-    # Pick amount column
     amt_col = None
     for name in ["Amount", "Charge Amount", "CAD$", "Amount (CAD)"]:
         if name in df.columns:
             amt_col = name
             break
     if amt_col is None:
-        # heuristic: most money-like column
         amt_col = df.columns[moneylike_col_idx(df)]
 
     out = pd.DataFrame(
@@ -161,13 +153,10 @@ def parse_amex_summary_with_headers(path: Path) -> pd.DataFrame:
 
 
 def parse_visa_headerless(path: Path) -> Optional[pd.DataFrame]:
-    # Handles e.g. accountactivity(2).csv (no header)
     df = pd.read_csv(path, header=None, dtype=str)
     if not re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", str(df.iloc[0, 0])):
         return None
 
-    # Expect layout: [Date, Description, Debit?, Credit?, Balance?]
-    # Pick two numeric columns as debit/credit
     numeric_cols = []
     for c in range(2, df.shape[1]):
         series = df[c].astype(str)
@@ -251,43 +240,59 @@ def parse_one(path: Path) -> pd.DataFrame:
 
 # ---------------- Main ----------------
 
+def to_4cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the 4 requested columns in the desired order/names."""
+    out = pd.DataFrame()
+    out["number day"] = df["date"].dt.day.astype(int)
+    out["description"] = df["name"].astype(str)
+    out["price"] = df["price"].astype(float)
+    out["fulldate"] = df["date"].dt.strftime("%Y-%m-%d")
+    return out
+
 def main():
     OUT_BASE.mkdir(parents=True, exist_ok=True)
     MONTH_DIR.mkdir(parents=True, exist_ok=True)
 
-    frames = []
-    for fname in FILES:
-        in_path = DATA_DIR / fname
-        if not in_path.exists():
-            print(f"⚠️  Missing: {in_path}")
-            continue
-        try:
-            dfo = parse_one(in_path)
-            out_file = OUT_BASE / f"formatted_{in_path.stem}.csv"
-            dfo[["date", "name", "price", "account", "source"]].to_csv(out_file, index=False)
-            frames.append(dfo)
-            print(f"✅ {fname} → {out_file.name} ({len(dfo)} rows)")
-        except Exception as e:
-            print(f"❌ {fname}: {e}")
+    input_files = list_input_files()
+    if not input_files:
+        print(f"No files found matching report*.csv in {DATA_DIR}")
+        return
 
-    if not frames:
+    parsed_frames = []
+    for in_path in input_files:
+        try:
+            dfo = parse_one(in_path)  # columns: date, name, price, account, source
+            # write per-file (4 columns)
+            out_file = OUT_BASE / f"formatted_{in_path.stem}.csv"
+            to_4cols(dfo).to_csv(out_file, index=False)
+            parsed_frames.append(dfo)
+            print(f"✅ {in_path.name} → {out_file.name} ({len(dfo)} rows)")
+        except Exception as e:
+            print(f"❌ {in_path.name}: {e}")
+
+    if not parsed_frames:
         print("No files parsed.")
         return
 
-    combined = pd.concat(frames, ignore_index=True)
-    combined["month"] = combined["date"].dt.strftime("%Y-%m")
+    combined_raw = pd.concat(parsed_frames, ignore_index=True)
+
+    # Combined output (4 columns)
+    combined_4 = to_4cols(combined_raw)
     combined_file = OUT_BASE / "combined_all.csv"
-    combined[["date", "name", "price", "account", "source", "month"]].to_csv(combined_file, index=False)
+    combined_4.to_csv(combined_file, index=False)
     print(f"📦 Combined → {combined_file}")
 
-    by_month = combined.groupby("month", sort=True)
-    for month, dfm in by_month:
+    # Monthly splits (4 columns), sorted by date
+    combined_raw["month"] = combined_raw["date"].dt.strftime("%Y-%m")
+    for month, dfm in combined_raw.groupby("month", sort=True):
+        dfm_sorted = dfm.sort_values("date")
         mp = MONTH_DIR / f"{month}.csv"
-        dfm[["date", "name", "price", "account", "source"]].sort_values("date").to_csv(mp, index=False)
+        to_4cols(dfm_sorted).to_csv(mp, index=False)
         print(f"🗓  {month} → {mp}")
 
-    # quick console summary
-    summary = combined.groupby("month").agg(transactions=("price", "size"), spend_total=("price", "sum")).reset_index()
+    # quick console summary (unchanged logic)
+    summary = combined_raw.groupby("month").agg(transactions=("price", "size"),
+                                                spend_total=("price", "sum")).reset_index()
     print("\nSummary by month:")
     for _, r in summary.iterrows():
         print(f"  {r['month']}: {int(r['transactions'])} txns, total {r['spend_total']:.2f}")
